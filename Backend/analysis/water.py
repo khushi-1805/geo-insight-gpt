@@ -5,38 +5,24 @@ Planetary Computer.
 Method:
     MNDWI = (Green - SWIR) / (Green + SWIR)
 
-Water pixels are initially identified using:
+Water pixels:
     MNDWI > 0
 
 The analysis is restricted to the exact Polygon/MultiPolygon
 returned by location.py.
 
-Sentinel-2 bands:
-    B03 -> Green (10 m)
-    B11 -> SWIR  (20 m)
-    SCL -> Scene Classification Layer
+Performance optimization:
+    Candidate Sentinel-2 scenes are first checked for whether
+    their footprint intersects the actual AOI. Scenes that do
+    not sufficiently cover the AOI are deprioritized before
+    expensive raster reads.
 
-Processing:
-    Exact polygon
-        ↓
-    Polygon-derived satellite search
-        ↓
-    Fixed seasonal window
-        ↓
-    B03 + B11
-        ↓
-    Resample B11 to B03 grid
-        ↓
-    SCL masking
-        ↓
-    MNDWI
-        ↓
-    Water pixels
-        ↓
-    Water coverage %
+IMPORTANT:
+    The actual water-analysis logic is unchanged.
 """
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.append(
@@ -58,19 +44,52 @@ from rasterio.enums import Resampling
 # Configuration
 # ---------------------------------------------------------------------
 
-STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+STAC_URL = (
+    "https://planetarycomputer.microsoft.com/api/stac/v1"
+)
 
 COLLECTION = "sentinel-2-l2a"
 
-# Buffer around the polygon's bounding box for scene search.
-# This is ONLY used for finding candidate satellite scenes.
+
+# ---------------------------------------------------------------------
+# Reusable Planetary Computer catalog
+# ---------------------------------------------------------------------
+
+_catalog = None
+
+
+def get_catalog():
+
+    global _catalog
+
+    if _catalog is None:
+
+        print(
+            "\nConnecting to Microsoft Planetary Computer..."
+        )
+
+        _catalog = pystac_client.Client.open(
+            STAC_URL,
+            modifier=planetary_computer.sign_inplace
+        )
+
+        print(
+            "Planetary Computer connection ready."
+        )
+
+    return _catalog
+
+
+# ---------------------------------------------------------------------
+# Satellite search configuration
+# ---------------------------------------------------------------------
+
 SEARCH_BUFFER_DEG = 0.02
 
 MAX_SCENE_CLOUD_COVER = 20
 
 MIN_VALID_PIXEL_FRACTION = 0.5
 
-# Initial MNDWI threshold.
 WATER_MNDWI_THRESHOLD = 0.0
 
 SENTINEL2_SCALE = 10000.0
@@ -80,11 +99,6 @@ SENTINEL2_SCALE = 10000.0
 # Fixed seasonal window
 # ---------------------------------------------------------------------
 
-# Keep the same months for every year to reduce seasonal bias.
-#
-# You can change these later depending on the region.
-#
-# January -> March
 SEASON_START_MONTH = 1
 SEASON_END_MONTH = 3
 
@@ -128,6 +142,129 @@ def calculate_mndwi(
 
 
 # ---------------------------------------------------------------------
+# Scene footprint / AOI compatibility
+# ---------------------------------------------------------------------
+
+def _scene_intersects_aoi(
+    image,
+    geometry
+):
+    """
+    Check whether the Sentinel-2 scene footprint intersects
+    the requested AOI.
+
+    This is only a pre-filter.
+
+    The existing 50% valid-pixel test remains the final
+    validation after raster data is actually read.
+    """
+
+    try:
+
+        scene_geometry = image.geometry
+
+        if scene_geometry is None:
+            return False
+
+        aoi_raster_geometry = geometry
+
+        # Use Shapely if available through the STAC geometry.
+        from shapely.geometry import shape
+
+        scene_shape = shape(
+            scene_geometry
+        )
+
+        aoi_shape = shape(
+            aoi_raster_geometry
+        )
+
+        return scene_shape.intersects(
+            aoi_shape
+        )
+
+    except Exception:
+
+        # If footprint checking fails for any reason,
+        # do NOT reject the scene.
+        #
+        # The existing valid-pixel check will still
+        # determine whether the scene is usable.
+        return True
+
+
+# ---------------------------------------------------------------------
+# Calculate approximate scene/AOI overlap
+# ---------------------------------------------------------------------
+
+def _scene_overlap_ratio(
+    image,
+    geometry
+):
+    """
+    Estimate how much of the AOI is covered by the
+    Sentinel-2 scene footprint.
+
+    This value is used ONLY to prioritize candidates.
+
+    It does not replace the existing valid-pixel check.
+    """
+
+    try:
+
+        from shapely.geometry import shape
+
+        scene_geometry = image.geometry
+
+        if scene_geometry is None:
+            return 0.0
+
+        scene_shape = shape(
+            scene_geometry
+        )
+
+        aoi_shape = shape(
+            geometry
+        )
+
+        if not scene_shape.intersects(
+            aoi_shape
+        ):
+            return 0.0
+
+        intersection = (
+            scene_shape.intersection(
+                aoi_shape
+            )
+        )
+
+        if aoi_shape.area == 0:
+            return 0.0
+
+        ratio = (
+            intersection.area
+            /
+            aoi_shape.area
+        )
+
+        return float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    ratio
+                )
+            )
+        )
+
+    except Exception:
+
+        # If overlap calculation fails,
+        # keep the scene eligible.
+        return 1.0
+
+
+# ---------------------------------------------------------------------
 # Sentinel-2 scene search
 # ---------------------------------------------------------------------
 
@@ -138,13 +275,12 @@ def get_candidate_sentinel_images(
     season_end_month=SEASON_END_MONTH
 ):
 
-    catalog = pystac_client.Client.open(
-        STAC_URL,
-        modifier=planetary_computer.sign_inplace
-    )
+    search_start_time = time.perf_counter()
+
+    catalog = get_catalog()
 
     # -------------------------------------------------------------
-    # Use the actual polygon bounds.
+    # Exact AOI bounding box
     # -------------------------------------------------------------
 
     left, bottom, right, top = bounds(
@@ -159,7 +295,7 @@ def get_candidate_sentinel_images(
     ]
 
     # -------------------------------------------------------------
-    # Fixed seasonal window.
+    # Seasonal window
     # -------------------------------------------------------------
 
     start_date = (
@@ -180,6 +316,20 @@ def get_candidate_sentinel_images(
             f"{season_end_month + 1:02d}-01"
         )
 
+    print(
+        f"\nSearching Sentinel-2 scenes for {year}..."
+    )
+
+    print(
+        f"Search period: "
+        f"{start_date} → {end_date}"
+    )
+
+    print(
+        f"Cloud cover limit: "
+        f"{MAX_SCENE_CLOUD_COVER}%"
+    )
+
     search = catalog.search(
         collections=[COLLECTION],
         bbox=bbox,
@@ -191,24 +341,171 @@ def get_candidate_sentinel_images(
         }
     )
 
+    print(
+        "Fetching candidate scenes..."
+    )
+
     items = list(
         search.items()
+    )
+
+    search_elapsed = (
+        time.perf_counter()
+        - search_start_time
+    )
+
+    print(
+        f"Scene search completed in "
+        f"{search_elapsed:.2f}s"
     )
 
     if not items:
 
         raise ValueError(
-            f"No suitable satellite image found "
-            f"for {year} in the window "
-            f"{start_date} to {end_date}."
+            f"No suitable satellite image "
+            f"found for {year}."
         )
 
-    # Least cloudy scene first.
-    items.sort(
-        key=lambda item:
-        item.properties.get(
+    print(
+        f"Candidate scenes found: "
+        f"{len(items)}"
+    )
+
+    # -------------------------------------------------------------
+    # Footprint filtering
+    # -------------------------------------------------------------
+    #
+    # Remove scenes whose footprint does not intersect
+    # the AOI at all.
+    #
+    # This does NOT perform any raster processing.
+    # -------------------------------------------------------------
+
+    intersecting_items = []
+
+    for image in items:
+
+        if _scene_intersects_aoi(
+            image,
+            geometry
+        ):
+
+            intersecting_items.append(
+                image
+            )
+
+    print(
+        f"Scenes intersecting AOI: "
+        f"{len(intersecting_items)}"
+    )
+
+    # If the footprint check somehow returns nothing,
+    # fall back to the original candidate list.
+    if not intersecting_items:
+
+        print(
+            "Warning: no footprint intersection "
+            "was detected."
+        )
+
+        print(
+            "Falling back to all candidate scenes."
+        )
+
+        intersecting_items = items
+
+    # -------------------------------------------------------------
+    # Calculate approximate AOI overlap
+    # -------------------------------------------------------------
+
+    ranked_items = []
+
+    for image in intersecting_items:
+
+        overlap_ratio = (
+            _scene_overlap_ratio(
+                image,
+                geometry
+            )
+        )
+
+        cloud_cover = image.properties.get(
             "eo:cloud_cover",
             100
+        )
+
+        ranked_items.append(
+            (
+                image,
+                overlap_ratio,
+                cloud_cover
+            )
+        )
+
+    # -------------------------------------------------------------
+    # Sort candidates
+    #
+    # PRIMARY:
+    #     AOI coverage
+    #
+    # SECONDARY:
+    #     cloud cover
+    #
+    # This means a scene that actually covers the AOI
+    # is preferred over a very cloudy-free scene that
+    # only covers a small part of the AOI.
+    # -------------------------------------------------------------
+
+    ranked_items.sort(
+        key=lambda item: (
+            -item[1],
+            item[2]
+        )
+    )
+
+    items = [
+        item[0]
+        for item in ranked_items
+    ]
+
+    # -------------------------------------------------------------
+    # Display ranking
+    # -------------------------------------------------------------
+
+    print(
+        "\nTop candidate scenes:"
+    )
+
+    for index, (
+        image,
+        overlap_ratio,
+        cloud_cover
+    ) in enumerate(
+        ranked_items[:10],
+        start=1
+    ):
+
+        print(
+            f"{index}. "
+            f"{image.id} | "
+            f"AOI overlap: "
+            f"{overlap_ratio:.1%} | "
+            f"Cloud: "
+            f"{cloud_cover}"
+        )
+
+    print(
+        "\nSelected first candidate:"
+    )
+
+    print(
+        items[0].id
+    )
+
+    print(
+        "Cloud cover:",
+        items[0].properties.get(
+            "eo:cloud_cover"
         )
     )
 
@@ -228,6 +525,8 @@ def _read_window(
     target_shape=None,
     resampling=Resampling.nearest
 ):
+
+    start_time = time.perf_counter()
 
     with rasterio.open(
         href
@@ -293,6 +592,16 @@ def _read_window(
 
         crs = src.crs
 
+    elapsed = (
+        time.perf_counter()
+        - start_time
+    )
+
+    print(
+        f"Raster read completed in "
+        f"{elapsed:.2f}s"
+    )
+
     return (
         data,
         nodata,
@@ -310,6 +619,11 @@ def _read_aoi_data(
     geometry
 ):
 
+    print(
+        f"\nReading satellite data for scene: "
+        f"{image.id}"
+    )
+
     # ---------------------------------------------------------------
     # Polygon bounding box
     # ---------------------------------------------------------------
@@ -318,11 +632,19 @@ def _read_aoi_data(
         geometry
     )
 
+    print(
+        "AOI bounds:",
+        f"{left:.5f}, {bottom:.5f}, "
+        f"{right:.5f}, {top:.5f}"
+    )
+
     # ---------------------------------------------------------------
-    # B03 = Green, 10 m.
-    #
-    # B03 becomes our reference grid.
+    # B03 = Green, 10 m
     # ---------------------------------------------------------------
+
+    print(
+        "Reading B03 (Green, 10 m)..."
+    )
 
     green, green_nodata, green_transform, green_crs = (
         _read_window(
@@ -334,12 +656,22 @@ def _read_aoi_data(
         )
     )
 
+    print(
+        f"B03 loaded: "
+        f"{green.shape[0]} x "
+        f"{green.shape[1]}"
+    )
+
     # ---------------------------------------------------------------
-    # B11 = SWIR, native 20 m.
+    # B11 = SWIR, 20 m
     #
-    # Resample B11 to the B03 10 m grid.
-    # Bilinear is used because reflectance is continuous.
+    # Resample to B03 10 m grid.
     # ---------------------------------------------------------------
+
+    print(
+        "Reading B11 (SWIR, 20 m) "
+        "and resampling to B03 grid..."
+    )
 
     swir, swir_nodata, swir_transform, swir_crs = (
         _read_window(
@@ -353,8 +685,14 @@ def _read_aoi_data(
         )
     )
 
+    print(
+        f"B11 loaded/resampled: "
+        f"{swir.shape[0]} x "
+        f"{swir.shape[1]}"
+    )
+
     # ---------------------------------------------------------------
-    # Check shapes
+    # Shape check
     # ---------------------------------------------------------------
 
     if swir.shape != green.shape:
@@ -362,22 +700,23 @@ def _read_aoi_data(
         raise ValueError(
             f"B03/B11 shape mismatch for "
             f"{image.id}: "
-            f"{green.shape} vs {swir.shape}"
+            f"{green.shape} vs "
+            f"{swir.shape}"
         )
 
     # ---------------------------------------------------------------
-    # Transform exact polygon into raster CRS
+    # Polygon transformation
     # ---------------------------------------------------------------
+
+    print(
+        "Creating exact polygon mask..."
+    )
 
     polygon_raster = transform_geom(
         "EPSG:4326",
         green_crs,
         geometry
     )
-
-    # ---------------------------------------------------------------
-    # Exact polygon mask
-    # ---------------------------------------------------------------
 
     inside_polygon = geometry_mask(
         [polygon_raster],
@@ -387,7 +726,7 @@ def _read_aoi_data(
     )
 
     # ---------------------------------------------------------------
-    # Basic valid-pixel mask
+    # Basic valid pixels
     # ---------------------------------------------------------------
 
     valid = (
@@ -396,14 +735,18 @@ def _read_aoi_data(
         (swir != swir_nodata)
     )
 
-    # Only pixels inside the exact polygon.
     valid &= inside_polygon
 
     # ---------------------------------------------------------------
-    # SCL cloud/shadow masking
+    # SCL masking
     # ---------------------------------------------------------------
 
     if "SCL" in image.assets:
+
+        print(
+            "Reading SCL and applying "
+            "cloud/invalid-pixel mask..."
+        )
 
         scl, _, _, _ = _read_window(
             image.assets["SCL"].href,
@@ -418,6 +761,14 @@ def _read_aoi_data(
         for code in SCL_EXCLUDE_VALUES:
 
             valid &= scl != code
+
+        print(
+            "SCL masking complete."
+        )
+
+    print(
+        "Satellite data processing complete."
+    )
 
     return (
         green,
@@ -438,6 +789,24 @@ def calculate_yearly_water(
     year
 ):
 
+    year_start_time = time.perf_counter()
+
+    print(
+        "\n========================================"
+    )
+
+    print(
+        f"STARTING WATER ANALYSIS: {year}"
+    )
+
+    print(
+        "========================================"
+    )
+
+    # ---------------------------------------------------------------
+    # Candidate scenes
+    # ---------------------------------------------------------------
+
     candidates = get_candidate_sentinel_images(
         geometry,
         year
@@ -445,7 +814,24 @@ def calculate_yearly_water(
 
     last_error = None
 
-    for image in candidates:
+    # ---------------------------------------------------------------
+    # Try candidates
+    # ---------------------------------------------------------------
+
+    for scene_number, image in enumerate(
+        candidates,
+        start=1
+    ):
+
+        print(
+            f"\nTrying scene "
+            f"{scene_number}/"
+            f"{len(candidates)}:"
+        )
+
+        print(
+            image.id
+        )
 
         try:
 
@@ -462,6 +848,10 @@ def calculate_yearly_water(
         except Exception as error:
 
             last_error = error
+
+            print(
+                f"Scene failed: {error}"
+            )
 
             continue
 
@@ -480,10 +870,15 @@ def calculate_yearly_water(
                 "the satellite image."
             )
 
+            print(
+                "Scene rejected: polygon "
+                "does not overlap image."
+            )
+
             continue
 
         # -----------------------------------------------------------
-        # Valid coverage
+        # Valid pixel fraction
         # -----------------------------------------------------------
 
         valid_fraction = (
@@ -492,18 +887,34 @@ def calculate_yearly_water(
             polygon_pixels
         )
 
+        print(
+            f"Valid pixel fraction: "
+            f"{valid_fraction:.2%}"
+        )
+
+        # -----------------------------------------------------------
+        # IMPORTANT:
+        # Keep the original 50% validation.
+        # -----------------------------------------------------------
+
         if valid_fraction < MIN_VALID_PIXEL_FRACTION:
 
             last_error = ValueError(
-                f"Only {valid_fraction:.0%} valid "
-                f"pixels inside polygon for "
-                f"{image.id}."
+                f"Only {valid_fraction:.0%} "
+                f"valid pixels inside "
+                f"polygon for {image.id}."
+            )
+
+            print(
+                "Scene rejected: valid coverage "
+                f"is below "
+                f"{MIN_VALID_PIXEL_FRACTION:.0%}."
             )
 
             continue
 
         # -----------------------------------------------------------
-        # Scale reflectance
+        # Scale Sentinel-2 reflectance
         # -----------------------------------------------------------
 
         green_scaled = (
@@ -517,6 +928,10 @@ def calculate_yearly_water(
         # -----------------------------------------------------------
         # MNDWI
         # -----------------------------------------------------------
+
+        print(
+            "Calculating MNDWI..."
+        )
 
         mndwi = calculate_mndwi(
             green_scaled,
@@ -534,6 +949,10 @@ def calculate_yearly_water(
         #
         # MNDWI > 0
         # -----------------------------------------------------------
+
+        print(
+            "Classifying water pixels..."
+        )
 
         water_pixels = (
             mndwi_valid
@@ -561,6 +980,16 @@ def calculate_yearly_water(
             np.nanmean(
                 mndwi_valid
             )
+        )
+
+        # -----------------------------------------------------------
+        # Timing
+        # -----------------------------------------------------------
+
+        year_elapsed = (
+            time.perf_counter()
+            -
+            year_start_time
         )
 
         # -----------------------------------------------------------
@@ -613,6 +1042,16 @@ def calculate_yearly_water(
             f"{average_mndwi:.3f}"
         )
 
+        print(
+            f"Total processing time "
+            f"for {year}: "
+            f"{year_elapsed:.2f}s"
+        )
+
+        print(
+            "=============================="
+        )
+
         return {
             "year": year,
             "water_percentage": water_percentage,
@@ -627,6 +1066,10 @@ def calculate_yearly_water(
             "valid_pixel_fraction": valid_fraction
         }
 
+    # ---------------------------------------------------------------
+    # No suitable scene
+    # ---------------------------------------------------------------
+
     raise ValueError(
         f"No scene for {year} had enough "
         f"valid coverage inside the exact "
@@ -636,7 +1079,7 @@ def calculate_yearly_water(
 
 
 # ---------------------------------------------------------------------
-# Standalone test
+# Standalone testing
 # ---------------------------------------------------------------------
 
 def main():
@@ -648,11 +1091,15 @@ def main():
     )
 
     start_year = int(
-        input("Enter start year: ")
+        input(
+            "Enter start year: "
+        )
     )
 
     end_year = int(
-        input("Enter end year: ")
+        input(
+            "Enter end year: "
+        )
     )
 
     location = get_coordinates(
@@ -671,7 +1118,9 @@ def main():
         "geometry"
     ]
 
-    print("\nLocation found:")
+    print(
+        "\nLocation found:"
+    )
 
     print(
         location["name"]
@@ -693,6 +1142,10 @@ def main():
     )
 
     results = []
+
+    # ---------------------------------------------------------------
+    # Year-by-year analysis
+    # ---------------------------------------------------------------
 
     for year in range(
         start_year,
@@ -720,7 +1173,7 @@ def main():
             )
 
     # ---------------------------------------------------------------
-    # Trend
+    # Water trend
     # ---------------------------------------------------------------
 
     print(
@@ -767,6 +1220,19 @@ def main():
             f"{change:+.2f} "
             f"percentage points"
         )
+
+        if first != 0:
+
+            print(
+                f"{(change / first) * 100:+.2f}%"
+            )
+
+        else:
+
+            print(
+                "Percentage change undefined "
+                "(starting value was 0%)."
+            )
 
 
 # ---------------------------------------------------------------------

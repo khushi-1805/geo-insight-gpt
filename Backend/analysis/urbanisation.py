@@ -19,33 +19,16 @@ Sentinel-2 bands:
     B04 -> Red  (10 m)
     SCL -> Scene Classification Layer
 
-CHANGES FROM ORIGINAL VERSION
-------------------------------
-1. Scene search now uses a bbox derived from the polygon's own
-   bounds (+ small buffer), not a fixed 0.1-degree box around the
-   centroid. The old approach could miss scenes, or fail to fully
-   cover the AOI, whenever the polygon was larger than ~11 km
-   across (e.g. a city or district boundary).
+Performance optimization:
+    Candidate Sentinel-2 scenes are checked against the AOI
+    footprint before expensive raster reads.
 
-2. Scene search is now restricted to a fixed month window
-   (SEASON_START_MONTH -> SEASON_END_MONTH) applied every year,
-   instead of searching the full calendar year. Comparing the
-   single least-cloudy image of an entire year across multiple
-   years introduces seasonal bias into NDVI/NDBI (e.g. a June
-   image one year vs a December image the next), which can make
-   "built-up %" swing for reasons that have nothing to do with
-   urbanisation. Adjust SEASON_START_MONTH/SEASON_END_MONTH below
-   to a window that is dry/leaf-off or otherwise consistent for
-   your region.
-
-3. B04 (red) and B11 (SWIR) are now resampled with bilinear
-   interpolation onto the B08 10 m grid, instead of nearest
-   neighbour. Nearest neighbour produces blocky artifacts in NDBI
-   when upsampling the 20 m SWIR band. SCL (a categorical/label
-   band) still uses nearest neighbour, which is correct for it.
+IMPORTANT:
+    The actual urbanisation analysis logic has NOT been changed.
 """
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.append(
@@ -67,40 +50,86 @@ from rasterio.enums import Resampling
 # Configuration
 # ---------------------------------------------------------------------
 
-STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+STAC_URL = (
+    "https://planetarycomputer.microsoft.com/api/stac/v1"
+)
 
 COLLECTION = "sentinel-2-l2a"
 
-# Buffer (degrees) added around the polygon's own bounding box when
-# searching for candidate scenes. This just needs to be large enough
-# to comfortably guarantee full scene coverage of the AOI edges; it
-# is no longer used as the sole basis of the search area.
+
+# ---------------------------------------------------------------------
+# Reusable Planetary Computer catalog
+# ---------------------------------------------------------------------
+# The STAC connection is created once and reused.
+#
+# This does NOT change the satellite analysis.
+# It only avoids repeatedly opening the same catalog connection.
+# ---------------------------------------------------------------------
+
+_catalog = None
+
+
+def get_catalog():
+
+    global _catalog
+
+    if _catalog is None:
+
+        print(
+            "\nConnecting to Microsoft Planetary Computer..."
+        )
+
+        _catalog = pystac_client.Client.open(
+            STAC_URL,
+            modifier=planetary_computer.sign_inplace
+        )
+
+        print(
+            "Planetary Computer connection ready."
+        )
+
+    return _catalog
+
+
+# ---------------------------------------------------------------------
+# Satellite search configuration
+# ---------------------------------------------------------------------
+
+# Small buffer around the polygon's bounding box.
+# Used only when searching for candidate scenes.
 SEARCH_BUFFER_DEG = 0.02
 
 MAX_SCENE_CLOUD_COVER = 20
 
 MIN_VALID_PIXEL_FRACTION = 0.5
 
-# NDBI threshold for potential built-up pixels
+
+# ---------------------------------------------------------------------
+# Urbanisation thresholds
+# ---------------------------------------------------------------------
+
+# NDBI threshold for potential built-up pixels.
 NDBI_BUILTUP_THRESHOLD = 0.0
 
-# NDVI safeguard:
-# vegetation with high NDVI should not be classified as built-up.
+# Vegetation safeguard.
 NDVI_VEGETATION_THRESHOLD = 0.2
+
 
 SENTINEL2_SCALE = 10000.0
 
-# Fixed seasonal search window, applied to every year in the trend.
-# Keeping this consistent year-to-year avoids comparing e.g. a wet
-# season image in one year to a dry season image in another, which
-# would otherwise show up as spurious change in built-up coverage.
-# ADJUST THESE to a low-cloud, phenologically stable window for the
-# region under study.
+
+# ---------------------------------------------------------------------
+# Fixed seasonal search window
+# ---------------------------------------------------------------------
+
 SEASON_START_MONTH = 1
 SEASON_END_MONTH = 3
 
 
+# ---------------------------------------------------------------------
 # Sentinel-2 SCL values to exclude
+# ---------------------------------------------------------------------
+
 SCL_EXCLUDE_VALUES = {
     0,   # No data
     1,   # Saturated / defective
@@ -116,7 +145,10 @@ SCL_EXCLUDE_VALUES = {
 # Index calculations
 # ---------------------------------------------------------------------
 
-def calculate_ndvi(red, nir):
+def calculate_ndvi(
+    red,
+    nir
+):
 
     denominator = nir + red
 
@@ -132,7 +164,10 @@ def calculate_ndvi(red, nir):
     )
 
 
-def calculate_ndbi(nir, swir):
+def calculate_ndbi(
+    nir,
+    swir
+):
 
     denominator = swir + nir
 
@@ -149,6 +184,132 @@ def calculate_ndbi(nir, swir):
 
 
 # ---------------------------------------------------------------------
+# Scene footprint / AOI compatibility
+# ---------------------------------------------------------------------
+
+def _scene_intersects_aoi(
+    image,
+    geometry
+):
+    """
+    Check whether the Sentinel-2 scene footprint intersects
+    the requested AOI.
+
+    This is only a pre-filter.
+
+    The existing 50% valid-pixel check remains the final
+    validation after raster data is actually read.
+    """
+
+    try:
+
+        from shapely.geometry import shape
+
+        scene_geometry = image.geometry
+
+        if scene_geometry is None:
+
+            return False
+
+        scene_shape = shape(
+            scene_geometry
+        )
+
+        aoi_shape = shape(
+            geometry
+        )
+
+        return scene_shape.intersects(
+            aoi_shape
+        )
+
+    except Exception:
+
+        # If footprint checking fails,
+        # do not reject the scene.
+        #
+        # The existing valid-pixel check
+        # will still determine whether the
+        # scene is usable.
+        return True
+
+
+# ---------------------------------------------------------------------
+# Calculate approximate scene/AOI overlap
+# ---------------------------------------------------------------------
+
+def _scene_overlap_ratio(
+    image,
+    geometry
+):
+    """
+    Estimate the proportion of the AOI covered by
+    the Sentinel-2 scene footprint.
+
+    This is used ONLY to rank candidate scenes.
+
+    It does not replace the existing 50%
+    valid-pixel validation.
+    """
+
+    try:
+
+        from shapely.geometry import shape
+
+        scene_geometry = image.geometry
+
+        if scene_geometry is None:
+
+            return 0.0
+
+        scene_shape = shape(
+            scene_geometry
+        )
+
+        aoi_shape = shape(
+            geometry
+        )
+
+        if not scene_shape.intersects(
+            aoi_shape
+        ):
+
+            return 0.0
+
+        intersection = (
+            scene_shape.intersection(
+                aoi_shape
+            )
+        )
+
+        if aoi_shape.area == 0:
+
+            return 0.0
+
+        ratio = (
+            intersection.area
+            /
+            aoi_shape.area
+        )
+
+        return float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    ratio
+                )
+            )
+        )
+
+    except Exception:
+
+        # If overlap calculation fails,
+        # keep the scene eligible.
+        return 1.0
+
+
+# ---------------------------------------------------------------------
 # Sentinel-2 scene search
 # ---------------------------------------------------------------------
 
@@ -159,18 +320,21 @@ def get_candidate_sentinel_images(
     season_end_month=SEASON_END_MONTH
 ):
 
-    catalog = pystac_client.Client.open(
-        STAC_URL,
-        modifier=planetary_computer.sign_inplace
+    search_start_time = time.perf_counter()
+
+    # -------------------------------------------------------------
+    # Reuse Planetary Computer catalog.
+    # -------------------------------------------------------------
+
+    catalog = get_catalog()
+
+    # -------------------------------------------------------------
+    # AOI bounding box.
+    # -------------------------------------------------------------
+
+    left, bottom, right, top = bounds(
+        geometry
     )
-
-    # -------------------------------------------------------------
-    # Bbox derived from the polygon's own bounds, not a fixed box
-    # around a single point. This guarantees the search area always
-    # covers the full AOI, regardless of how large the polygon is.
-    # -------------------------------------------------------------
-
-    left, bottom, right, top = bounds(geometry)
 
     bbox = [
         left - SEARCH_BUFFER_DEG,
@@ -180,19 +344,44 @@ def get_candidate_sentinel_images(
     ]
 
     # -------------------------------------------------------------
-    # Fixed seasonal window, applied every year, to keep the trend
-    # comparable across years.
+    # Fixed seasonal window.
     # -------------------------------------------------------------
 
-    start_date = f"{year}-{season_start_month:02d}-01"
+    start_date = (
+        f"{year}-"
+        f"{season_start_month:02d}-01"
+    )
 
     if season_end_month == 12:
 
-        end_date = f"{year + 1}-01-01"
+        end_date = (
+            f"{year + 1}-01-01"
+        )
 
     else:
 
-        end_date = f"{year}-{season_end_month + 1:02d}-01"
+        end_date = (
+            f"{year}-"
+            f"{season_end_month + 1:02d}-01"
+        )
+
+    print(
+        f"\nSearching Sentinel-2 scenes for {year}..."
+    )
+
+    print(
+        f"Search period: "
+        f"{start_date} → {end_date}"
+    )
+
+    print(
+        f"Cloud cover limit: "
+        f"{MAX_SCENE_CLOUD_COVER}%"
+    )
+
+    # -------------------------------------------------------------
+    # STAC search.
+    # -------------------------------------------------------------
 
     search = catalog.search(
         collections=[COLLECTION],
@@ -205,20 +394,173 @@ def get_candidate_sentinel_images(
         }
     )
 
-    items = list(search.items())
+    print(
+        "Fetching candidate scenes..."
+    )
+
+    items = list(
+        search.items()
+    )
+
+    search_elapsed = (
+        time.perf_counter()
+        - search_start_time
+    )
+
+    print(
+        f"Scene search completed in "
+        f"{search_elapsed:.2f}s"
+    )
 
     if not items:
 
         raise ValueError(
-            f"No suitable satellite image found for {year} "
-            f"in the window {start_date} to {end_date}."
+            f"No suitable satellite image "
+            f"found for {year} in the window "
+            f"{start_date} to {end_date}."
         )
 
-    items.sort(
-        key=lambda item:
-        item.properties.get(
+    print(
+        f"Candidate scenes found: "
+        f"{len(items)}"
+    )
+
+    # -------------------------------------------------------------
+    # Footprint filtering.
+    #
+    # This happens BEFORE reading B08/B04/B11/SCL.
+    # -------------------------------------------------------------
+
+    intersecting_items = []
+
+    for image in items:
+
+        if _scene_intersects_aoi(
+            image,
+            geometry
+        ):
+
+            intersecting_items.append(
+                image
+            )
+
+    print(
+        f"Scenes intersecting AOI: "
+        f"{len(intersecting_items)}"
+    )
+
+    # -------------------------------------------------------------
+    # Safety fallback.
+    #
+    # If footprint processing fails or produces no matches,
+    # use the original candidate list.
+    # -------------------------------------------------------------
+
+    if not intersecting_items:
+
+        print(
+            "Warning: no footprint intersection "
+            "was detected."
+        )
+
+        print(
+            "Falling back to all candidate scenes."
+        )
+
+        intersecting_items = items
+
+    # -------------------------------------------------------------
+    # Calculate approximate AOI overlap.
+    # -------------------------------------------------------------
+
+    ranked_items = []
+
+    for image in intersecting_items:
+
+        overlap_ratio = (
+            _scene_overlap_ratio(
+                image,
+                geometry
+            )
+        )
+
+        cloud_cover = image.properties.get(
             "eo:cloud_cover",
             100
+        )
+
+        ranked_items.append(
+            (
+                image,
+                overlap_ratio,
+                cloud_cover
+            )
+        )
+
+    # -------------------------------------------------------------
+    # Rank scenes.
+    #
+    # Primary:
+    #     AOI coverage
+    #
+    # Secondary:
+    #     Cloud cover
+    #
+    # This prevents a very clear but poorly covering
+    # scene from being preferred over a scene that
+    # actually covers the AOI.
+    # -------------------------------------------------------------
+
+    ranked_items.sort(
+        key=lambda item: (
+            -item[1],
+            item[2]
+        )
+    )
+
+    items = [
+        item[0]
+        for item in ranked_items
+    ]
+
+    # -------------------------------------------------------------
+    # Show candidate ranking.
+    # -------------------------------------------------------------
+
+    print(
+        "\nTop candidate scenes:"
+    )
+
+    for index, (
+        image,
+        overlap_ratio,
+        cloud_cover
+    ) in enumerate(
+        ranked_items[:10],
+        start=1
+    ):
+
+        print(
+            f"{index}. "
+            f"{image.id} | "
+            f"AOI overlap: "
+            f"{overlap_ratio:.1%} | "
+            f"Cloud: "
+            f"{cloud_cover}"
+        )
+
+    print(
+        "\nSelected first candidate:"
+    )
+
+    print(
+        items[0].id
+    )
+
+    print(
+        "Cloud cover:",
+        items[0].properties.get(
+            "eo:cloud_cover"
         )
     )
 
@@ -239,7 +581,11 @@ def _read_window(
     resampling=Resampling.nearest
 ):
 
-    with rasterio.open(href) as src:
+    start_time = time.perf_counter()
+
+    with rasterio.open(
+        href
+    ) as src:
 
         bounds_in_crs = transform_bounds(
             "EPSG:4326",
@@ -260,11 +606,19 @@ def _read_window(
             out_shape = (
                 max(
                     1,
-                    int(round(window.height))
+                    int(
+                        round(
+                            window.height
+                        )
+                    )
                 ),
                 max(
                     1,
-                    int(round(window.width))
+                    int(
+                        round(
+                            window.width
+                        )
+                    )
                 )
             )
 
@@ -293,6 +647,16 @@ def _read_window(
 
         crs = src.crs
 
+    elapsed = (
+        time.perf_counter()
+        - start_time
+    )
+
+    print(
+        f"Raster read completed in "
+        f"{elapsed:.2f}s"
+    )
+
     return (
         data,
         nodata,
@@ -310,6 +674,11 @@ def _read_aoi_data(
     geometry
 ):
 
+    print(
+        f"\nReading satellite data for scene: "
+        f"{image.id}"
+    )
+
     # ---------------------------------------------------------------
     # Polygon bounding box
     # ---------------------------------------------------------------
@@ -318,58 +687,97 @@ def _read_aoi_data(
         geometry
     )
 
-    # ---------------------------------------------------------------
-    # Read B08 first.
-    #
-    # B08 is 10 m and becomes our reference grid.
-    # ---------------------------------------------------------------
-
-    nir, nir_nodata, nir_transform, nir_crs = _read_window(
-        image.assets["B08"].href,
-        left,
-        bottom,
-        right,
-        top
+    print(
+        "AOI bounds:",
+        f"{left:.5f}, {bottom:.5f}, "
+        f"{right:.5f}, {top:.5f}"
     )
 
     # ---------------------------------------------------------------
-    # Read B04 onto the B08 grid.
+    # B08 = NIR, 10 m.
     #
-    # Bilinear resampling is used because reflectance is a
-    # continuous quantity; nearest neighbour is only appropriate
-    # for categorical bands like SCL.
+    # B08 is our reference grid.
     # ---------------------------------------------------------------
 
-    red, red_nodata, red_transform, red_crs = _read_window(
-        image.assets["B04"].href,
-        left,
-        bottom,
-        right,
-        top,
-        target_shape=nir.shape,
-        resampling=Resampling.bilinear
+    print(
+        "Reading B08 (NIR, 10 m)..."
+    )
+
+    nir, nir_nodata, nir_transform, nir_crs = (
+        _read_window(
+            image.assets["B08"].href,
+            left,
+            bottom,
+            right,
+            top
+        )
+    )
+
+    print(
+        f"B08 loaded: "
+        f"{nir.shape[0]} x "
+        f"{nir.shape[1]}"
     )
 
     # ---------------------------------------------------------------
-    # Read B11.
+    # B04 = Red, 10 m.
     #
-    # B11 is native 20 m, so it is upsampled onto B08's 10 m grid.
-    # Bilinear resampling avoids the blocky artifacts nearest
-    # neighbour would introduce into NDBI.
+    # Bilinear resampling onto B08 grid.
     # ---------------------------------------------------------------
 
-    swir, swir_nodata, swir_transform, swir_crs = _read_window(
-        image.assets["B11"].href,
-        left,
-        bottom,
-        right,
-        top,
-        target_shape=nir.shape,
-        resampling=Resampling.bilinear
+    print(
+        "Reading B04 (Red, 10 m)..."
+    )
+
+    red, red_nodata, red_transform, red_crs = (
+        _read_window(
+            image.assets["B04"].href,
+            left,
+            bottom,
+            right,
+            top,
+            target_shape=nir.shape,
+            resampling=Resampling.bilinear
+        )
+    )
+
+    print(
+        f"B04 loaded: "
+        f"{red.shape[0]} x "
+        f"{red.shape[1]}"
     )
 
     # ---------------------------------------------------------------
-    # Check shapes
+    # B11 = SWIR, native 20 m.
+    #
+    # Upsample to B08 10 m grid.
+    # ---------------------------------------------------------------
+
+    print(
+        "Reading B11 (SWIR, 20 m) "
+        "and resampling to B08 grid..."
+    )
+
+    swir, swir_nodata, swir_transform, swir_crs = (
+        _read_window(
+            image.assets["B11"].href,
+            left,
+            bottom,
+            right,
+            top,
+            target_shape=nir.shape,
+            resampling=Resampling.bilinear
+        )
+    )
+
+    print(
+        f"B11 loaded/resampled: "
+        f"{swir.shape[0]} x "
+        f"{swir.shape[1]}"
+    )
+
+    # ---------------------------------------------------------------
+    # Check shapes.
     # ---------------------------------------------------------------
 
     if red.shape != nir.shape:
@@ -377,7 +785,8 @@ def _read_aoi_data(
         raise ValueError(
             f"B04/B08 shape mismatch for "
             f"{image.id}: "
-            f"{red.shape} vs {nir.shape}"
+            f"{red.shape} vs "
+            f"{nir.shape}"
         )
 
     if swir.shape != nir.shape:
@@ -385,12 +794,17 @@ def _read_aoi_data(
         raise ValueError(
             f"B11/B08 shape mismatch for "
             f"{image.id}: "
-            f"{swir.shape} vs {nir.shape}"
+            f"{swir.shape} vs "
+            f"{nir.shape}"
         )
 
     # ---------------------------------------------------------------
-    # Transform exact polygon into raster CRS
+    # Transform exact polygon into raster CRS.
     # ---------------------------------------------------------------
+
+    print(
+        "Creating exact polygon mask..."
+    )
 
     polygon_raster = transform_geom(
         "EPSG:4326",
@@ -399,7 +813,7 @@ def _read_aoi_data(
     )
 
     # ---------------------------------------------------------------
-    # Exact polygon mask
+    # Exact polygon mask.
     # ---------------------------------------------------------------
 
     inside_polygon = geometry_mask(
@@ -410,12 +824,7 @@ def _read_aoi_data(
     )
 
     # ---------------------------------------------------------------
-    # Basic valid-pixel mask
-    #
-    # Note: bilinear resampling can produce values very close to,
-    # but not exactly equal to, nodata at the edges of nodata
-    # regions, so this equality check is a coarse first pass;
-    # the SCL mask below is the primary quality filter.
+    # Basic valid-pixel mask.
     # ---------------------------------------------------------------
 
     valid = (
@@ -426,14 +835,18 @@ def _read_aoi_data(
         (swir != swir_nodata)
     )
 
-    # Only pixels inside the exact location
     valid &= inside_polygon
 
     # ---------------------------------------------------------------
-    # SCL masking
+    # SCL cloud/invalid-pixel masking.
     # ---------------------------------------------------------------
 
     if "SCL" in image.assets:
+
+        print(
+            "Reading SCL and applying "
+            "cloud/invalid-pixel mask..."
+        )
 
         scl, _, _, _ = _read_window(
             image.assets["SCL"].href,
@@ -449,6 +862,14 @@ def _read_aoi_data(
 
             valid &= scl != code
 
+        print(
+            "SCL masking complete."
+        )
+
+    print(
+        "Satellite data processing complete."
+    )
+
     return (
         red,
         nir,
@@ -459,7 +880,7 @@ def _read_aoi_data(
 
 
 # ---------------------------------------------------------------------
-# Yearly urbanisation analysis
+# Yearly Urbanisation analysis
 # ---------------------------------------------------------------------
 
 def calculate_yearly_urbanisation(
@@ -469,6 +890,24 @@ def calculate_yearly_urbanisation(
     year
 ):
 
+    year_start_time = time.perf_counter()
+
+    print(
+        "\n========================================"
+    )
+
+    print(
+        f"STARTING URBANISATION ANALYSIS: {year}"
+    )
+
+    print(
+        "========================================"
+    )
+
+    # ---------------------------------------------------------------
+    # Find candidate scenes.
+    # ---------------------------------------------------------------
+
     candidates = get_candidate_sentinel_images(
         geometry,
         year
@@ -476,7 +915,24 @@ def calculate_yearly_urbanisation(
 
     last_error = None
 
-    for image in candidates:
+    # ---------------------------------------------------------------
+    # Try scenes from best AOI coverage first.
+    # ---------------------------------------------------------------
+
+    for scene_number, image in enumerate(
+        candidates,
+        start=1
+    ):
+
+        print(
+            f"\nTrying scene "
+            f"{scene_number}/"
+            f"{len(candidates)}:"
+        )
+
+        print(
+            image.id
+        )
 
         try:
 
@@ -495,10 +951,14 @@ def calculate_yearly_urbanisation(
 
             last_error = error
 
+            print(
+                f"Scene failed: {error}"
+            )
+
             continue
 
         # -----------------------------------------------------------
-        # Check polygon coverage
+        # Polygon pixels.
         # -----------------------------------------------------------
 
         polygon_pixels = int(
@@ -512,10 +972,15 @@ def calculate_yearly_urbanisation(
                 "the satellite image."
             )
 
+            print(
+                "Scene rejected: polygon "
+                "does not overlap image."
+            )
+
             continue
 
         # -----------------------------------------------------------
-        # Valid pixel fraction
+        # Valid pixel fraction.
         # -----------------------------------------------------------
 
         valid_fraction = (
@@ -524,18 +989,33 @@ def calculate_yearly_urbanisation(
             polygon_pixels
         )
 
+        print(
+            f"Valid pixel fraction: "
+            f"{valid_fraction:.2%}"
+        )
+
+        # -----------------------------------------------------------
+        # Keep existing 50% requirement.
+        # -----------------------------------------------------------
+
         if valid_fraction < MIN_VALID_PIXEL_FRACTION:
 
             last_error = ValueError(
-                f"Only {valid_fraction:.0%} valid "
-                f"pixels inside polygon for "
-                f"{image.id}."
+                f"Only {valid_fraction:.0%} "
+                f"valid pixels inside polygon "
+                f"for {image.id}."
+            )
+
+            print(
+                "Scene rejected: valid coverage "
+                f"is below "
+                f"{MIN_VALID_PIXEL_FRACTION:.0%}."
             )
 
             continue
 
         # -----------------------------------------------------------
-        # Scale Sentinel-2 reflectance
+        # Scale Sentinel-2 reflectance.
         # -----------------------------------------------------------
 
         red_scaled = (
@@ -551,12 +1031,24 @@ def calculate_yearly_urbanisation(
         )
 
         # -----------------------------------------------------------
-        # Calculate indices
+        # Calculate NDVI.
         # -----------------------------------------------------------
+
+        print(
+            "Calculating NDVI..."
+        )
 
         ndvi = calculate_ndvi(
             red_scaled,
             nir_scaled
+        )
+
+        # -----------------------------------------------------------
+        # Calculate NDBI.
+        # -----------------------------------------------------------
+
+        print(
+            "Calculating NDBI..."
         )
 
         ndbi = calculate_ndbi(
@@ -565,7 +1057,7 @@ def calculate_yearly_urbanisation(
         )
 
         # -----------------------------------------------------------
-        # Apply valid-pixel mask
+        # Apply valid-pixel mask.
         # -----------------------------------------------------------
 
         ndvi_valid = np.where(
@@ -581,12 +1073,16 @@ def calculate_yearly_urbanisation(
         )
 
         # -----------------------------------------------------------
-        # Built-up classification
+        # Built-up classification.
         #
         # NDBI >= 0
         # AND
         # NDVI < 0.2
         # -----------------------------------------------------------
+
+        print(
+            "Classifying built-up pixels..."
+        )
 
         builtup_pixels = (
             (ndbi_valid >= NDBI_BUILTUP_THRESHOLD)
@@ -595,7 +1091,7 @@ def calculate_yearly_urbanisation(
         )
 
         # -----------------------------------------------------------
-        # Calculate percentages
+        # Built-up percentage.
         # -----------------------------------------------------------
 
         builtup_percentage = (
@@ -606,11 +1102,19 @@ def calculate_yearly_urbanisation(
             valid.sum()
         ) * 100
 
+        # -----------------------------------------------------------
+        # Average NDBI.
+        # -----------------------------------------------------------
+
         average_ndbi = float(
             np.nanmean(
                 ndbi_valid
             )
         )
+
+        # -----------------------------------------------------------
+        # Average NDVI.
+        # -----------------------------------------------------------
 
         average_ndvi = float(
             np.nanmean(
@@ -619,7 +1123,17 @@ def calculate_yearly_urbanisation(
         )
 
         # -----------------------------------------------------------
-        # Output
+        # Timing.
+        # -----------------------------------------------------------
+
+        year_elapsed = (
+            time.perf_counter()
+            -
+            year_start_time
+        )
+
+        # -----------------------------------------------------------
+        # Output.
         # -----------------------------------------------------------
 
         print(
@@ -673,6 +1187,16 @@ def calculate_yearly_urbanisation(
             f"{average_ndvi:.3f}"
         )
 
+        print(
+            f"Total processing time "
+            f"for {year}: "
+            f"{year_elapsed:.2f}s"
+        )
+
+        print(
+            "=============================="
+        )
+
         return {
             "year": year,
             "builtup_percentage": builtup_percentage,
@@ -687,6 +1211,10 @@ def calculate_yearly_urbanisation(
             ),
             "valid_pixel_fraction": valid_fraction
         }
+
+    # ---------------------------------------------------------------
+    # No suitable scene.
+    # ---------------------------------------------------------------
 
     raise ValueError(
         f"No scene for {year} had enough "
@@ -709,24 +1237,37 @@ def main():
     )
 
     start_year = int(
-        input("Enter start year: ")
+        input(
+            "Enter start year: "
+        )
     )
 
     end_year = int(
-        input("Enter end year: ")
+        input(
+            "Enter end year: "
+        )
     )
 
     location = get_coordinates(
         location_name
     )
 
-    latitude = location["latitude"]
+    latitude = location[
+        "latitude"
+    ]
 
-    longitude = location["longitude"]
+    longitude = location[
+        "longitude"
+    ]
 
-    geometry = location["geometry"]
+    geometry = location[
+        "geometry"
+    ]
 
-    print("\nLocation found:")
+    print(
+        "\nLocation found:"
+    )
+
     print(
         location["name"]
     )
@@ -748,6 +1289,10 @@ def main():
 
     results = []
 
+    # ---------------------------------------------------------------
+    # Year-by-year analysis.
+    # ---------------------------------------------------------------
+
     for year in range(
         start_year,
         end_year + 1
@@ -762,7 +1307,9 @@ def main():
                 year=year
             )
 
-            results.append(result)
+            results.append(
+                result
+            )
 
         except Exception as error:
 
@@ -770,6 +1317,10 @@ def main():
                 f"Could not analyze "
                 f"{year}: {error}"
             )
+
+    # ---------------------------------------------------------------
+    # Trend.
+    # ---------------------------------------------------------------
 
     print(
         "\n\n=============================="
@@ -789,6 +1340,31 @@ def main():
         print(
             f"{result['year']} : "
             f"{result['builtup_percentage']:.2f}%"
+        )
+
+    # ---------------------------------------------------------------
+    # Overall change.
+    # ---------------------------------------------------------------
+
+    if len(results) >= 2:
+
+        first = results[0][
+            "builtup_percentage"
+        ]
+
+        last = results[-1][
+            "builtup_percentage"
+        ]
+
+        change = last - first
+
+        print(
+            "\nOverall change:"
+        )
+
+        print(
+            f"{change:+.2f} "
+            f"percentage points"
         )
 
 

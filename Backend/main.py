@@ -12,8 +12,18 @@ from llm.reporter import generate_report
 from analysis_engine import run_analysis
 
 
-app = FastAPI(title="Geo-Insight GPT API")
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
 
+app = FastAPI(
+    title="Geo-Insight GPT API"
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,10 +37,40 @@ app.add_middleware(
 )
 
 
+# ============================================================
+# ROOT ENDPOINT
+# ============================================================
+
 @app.get("/")
 def root():
+
     return {
         "message": "Geo-Insight GPT Backend Running"
+    }
+
+
+# ============================================================
+# EMPTY RESULTS STRUCTURE
+# ============================================================
+#
+# Used for general/casual questions.
+#
+# This prevents the frontend from crashing because it expects:
+#
+# results.analyses.vegetation
+# results.analyses.water
+# results.analyses.development
+#
+# ============================================================
+
+def empty_results():
+
+    return {
+        "analyses": {
+            "vegetation": [],
+            "water": [],
+            "development": []
+        }
     }
 
 
@@ -39,26 +79,88 @@ def root():
 # ============================================================
 
 @app.post("/ask")
-def ask_question(question: str):
+def ask_question(
+    question: str
+):
 
     try:
 
-        # 1. Understand question
+        # ====================================================
+        # 1. UNDERSTAND QUESTION
+        # ====================================================
+
         plan = understand_question(
             question
         )
 
-        # 2. Run satellite analysis
+
+        # ====================================================
+        # 2. GENERAL / CASUAL QUESTION
+        # ====================================================
+        #
+        # Examples:
+        #
+        # "What is NDVI?"
+        # "Explain MNDWI"
+        # "hi"
+        # "hello"
+        #
+        # No satellite analysis is required.
+        #
+        # ====================================================
+
+        if plan.get(
+            "intent"
+        ) in ["general", "casual"]:
+
+            results = empty_results()
+
+            report = generate_report(
+                question,
+                plan,
+                results
+            )
+
+            return {
+                "question": question,
+                "plan": plan,
+                "results": results,
+                "report": report
+            }
+
+
+        # ====================================================
+        # 3. ANALYSIS QUESTION
+        # ====================================================
+        #
+        # Example:
+        #
+        # "How has vegetation changed in Bengaluru
+        #  from 2020 to 2025?"
+        #
+        # Existing satellite-analysis pipeline is used.
+        #
+        # ====================================================
+
         results = run_analysis(
             plan
         )
 
-        # 3. Generate AI report
+
+        # ====================================================
+        # 4. GENERATE AI REPORT
+        # ====================================================
+
         report = generate_report(
             question,
             plan,
             results
         )
+
+
+        # ====================================================
+        # 5. RETURN RESULT
+        # ====================================================
 
         return {
             "question": question,
@@ -67,11 +169,19 @@ def ask_question(question: str):
             "report": report
         }
 
+
     except Exception as error:
 
-        print("\n===== ERROR =====")
+        print(
+            "\n===== ERROR ====="
+        )
+
         traceback.print_exc()
-        print("=================\n")
+
+        print(
+            "=================\n"
+        )
+
 
         raise HTTPException(
             status_code=500,
@@ -84,7 +194,9 @@ def ask_question(question: str):
 # ============================================================
 
 @app.post("/ask/stream")
-def ask_question_stream(question: str):
+def ask_question_stream(
+    question: str
+):
 
     # --------------------------------------------------------
     # Queue used to transfer progress events from the
@@ -93,21 +205,26 @@ def ask_question_stream(question: str):
 
     event_queue = queue.Queue()
 
-    # Sentinel value used to tell the streaming loop
-    # that the background worker has finished.
-    DONE = object()
 
     # --------------------------------------------------------
-    # Background worker
+    # Sentinel value used to tell the streaming loop
+    # that the background worker has finished.
     # --------------------------------------------------------
+
+    DONE = object()
+
+
+    # ========================================================
+    # BACKGROUND WORKER
+    # ========================================================
 
     def run_backend():
 
         try:
 
-            # ------------------------------------------------
-            # 1. Understand question
-            # ------------------------------------------------
+            # =================================================
+            # 1. UNDERSTAND QUESTION
+            # =================================================
 
             event_queue.put({
                 "type": "status",
@@ -115,70 +232,136 @@ def ask_question_stream(question: str):
                     "Understanding your geographic question..."
             })
 
+
             plan = understand_question(
                 question
             )
 
-            # ------------------------------------------------
-            # 2. Start satellite analysis
-            # ------------------------------------------------
 
-            event_queue.put({
-                "type": "status",
-                "message":
-                    "Starting satellite analysis..."
-            })
+            # =================================================
+            # 2. GENERAL / CASUAL QUESTION
+            # =================================================
+            #
+            # No satellite processing.
+            #
+            # =================================================
 
-            # ------------------------------------------------
-            # Progress callback
-            # ------------------------------------------------
+            if plan.get(
+                "intent"
+            ) in ["general", "casual"]:
 
-            def progress_callback(
-                event_type,
-                message,
-                year=None,
-                analysis=None,
-                total=None,
-                completed=None
-            ):
+                # ---------------------------------------------
+                # Status message
+                # ---------------------------------------------
+
+                if plan.get(
+                    "intent"
+                ) == "casual":
+
+                    event_queue.put({
+                        "type": "status",
+                        "message":
+                            "Preparing response..."
+                    })
+
+                else:
+
+                    event_queue.put({
+                        "type": "status",
+                        "message":
+                            "Preparing explanation..."
+                    })
+
+
+                # ---------------------------------------------
+                # Empty but valid results structure
+                # ---------------------------------------------
+
+                results = empty_results()
+
+
+                # ---------------------------------------------
+                # Generate response
+                # ---------------------------------------------
+
+                report = generate_report(
+                    question,
+                    plan,
+                    results
+                )
+
+
+            # =================================================
+            # 3. ANALYSIS QUESTION
+            # =================================================
+            #
+            # Existing satellite-analysis pipeline.
+            #
+            # =================================================
+
+            else:
 
                 event_queue.put({
-                    "type": event_type,
-                    "message": message,
-                    "year": year,
-                    "analysis": analysis,
-                    "total": total,
-                    "completed": completed
+                    "type": "status",
+                    "message":
+                        "Starting satellite analysis..."
                 })
 
-            # ------------------------------------------------
-            # Run actual analysis
-            # ------------------------------------------------
 
-            results = run_analysis(
-                plan,
-                progress_callback=progress_callback
-            )
+                # =============================================
+                # Progress callback
+                # =============================================
 
-            # ------------------------------------------------
-            # 3. Generate report
-            # ------------------------------------------------
+                def progress_callback(
+                    event_type,
+                    message,
+                    year=None,
+                    analysis=None,
+                    total=None,
+                    completed=None
+                ):
 
-            event_queue.put({
-                "type": "status",
-                "message":
-                    "Generating geographic report..."
-            })
+                    event_queue.put({
+                        "type": event_type,
+                        "message": message,
+                        "year": year,
+                        "analysis": analysis,
+                        "total": total,
+                        "completed": completed
+                    })
 
-            report = generate_report(
-                question,
-                plan,
-                results
-            )
 
-            # ------------------------------------------------
-            # 4. Final result
-            # ------------------------------------------------
+                # =============================================
+                # Run actual satellite analysis
+                # =============================================
+
+                results = run_analysis(
+                    plan,
+                    progress_callback=progress_callback
+                )
+
+
+                # =============================================
+                # Generate report
+                # =============================================
+
+                event_queue.put({
+                    "type": "status",
+                    "message":
+                        "Generating geographic report..."
+                })
+
+
+                report = generate_report(
+                    question,
+                    plan,
+                    results
+                )
+
+
+            # =================================================
+            # 4. FINAL RESULT
+            # =================================================
 
             final_result = {
                 "question": question,
@@ -187,10 +370,16 @@ def ask_question_stream(question: str):
                 "report": report
             }
 
+
             event_queue.put({
                 "type": "complete",
                 "result": final_result
             })
+
+
+        # =====================================================
+        # ERROR HANDLING
+        # =====================================================
 
         except Exception as error:
 
@@ -204,36 +393,47 @@ def ask_question_stream(question: str):
                 "===========================\n"
             )
 
+
             event_queue.put({
                 "type": "error",
                 "message": str(error)
             })
 
+
         finally:
 
+            # ------------------------------------------------
             # Tell SSE stream that the worker is finished.
-            event_queue.put(DONE)
+            # ------------------------------------------------
 
-    # --------------------------------------------------------
-    # Start backend processing in background
-    # --------------------------------------------------------
+            event_queue.put(
+                DONE
+            )
+
+
+    # ========================================================
+    # START BACKGROUND PROCESSING
+    # ========================================================
 
     worker = threading.Thread(
         target=run_backend,
         daemon=True
     )
 
+
     worker.start()
 
-    # --------------------------------------------------------
-    # SSE generator
-    # --------------------------------------------------------
+
+    # ========================================================
+    # SSE GENERATOR
+    # ========================================================
 
     def event_stream():
 
         while True:
 
             event = event_queue.get()
+
 
             # -----------------------------------------------
             # Background worker finished
@@ -242,6 +442,7 @@ def ask_question_stream(question: str):
             if event is DONE:
 
                 break
+
 
             # -----------------------------------------------
             # Convert event to SSE format
@@ -252,20 +453,23 @@ def ask_question_stream(question: str):
                 "status"
             )
 
+
             data = {
                 key: value
                 for key, value in event.items()
                 if key != "type"
             }
 
+
             yield (
                 f"event: {event_type}\n"
                 f"data: {json.dumps(data)}\n\n"
             )
 
-    # --------------------------------------------------------
-    # Return live SSE stream
-    # --------------------------------------------------------
+
+    # ========================================================
+    # RETURN LIVE SSE STREAM
+    # ========================================================
 
     return StreamingResponse(
         event_stream(),
