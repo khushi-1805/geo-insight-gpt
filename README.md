@@ -477,6 +477,48 @@ Future Prediction
 
 The prediction feature is an **extension of the existing satellite-analysis pipeline**, not a replacement for it.
 
+
+## 🌊 Flood Detection and Safer Route Selection
+
+Geo-Insight GPT includes a flood-routing module designed to assess flood-related risks along alternative routes and help users identify a potentially safer route.
+
+### Key Features
+
+- **Origin and destination input:** Accepts locations for route analysis.
+- **Geocoding:** Converts locations into geographic coordinates.
+- **Alternative route generation:** Retrieves possible driving routes using TomTom routing services.
+- **Route corridor creation:** Creates a 500-metre corridor around the routes for spatial analysis.
+- **Satellite-based flood analysis:** Uses satellite imagery and spectral analysis to identify water-affected areas along routes.
+- **Route risk assessment:** Samples points along each route and estimates the proportion classified as flooded.
+- **Safer route selection:** Compares the assessed routes and selects the route with the lowest estimated flood exposure when the available data supports a comparison.
+
+### How It Works
+
+1. The user provides an origin and destination.
+2. The locations are geocoded into coordinates.
+3. Alternative routes are retrieved through the routing service.
+4. A spatial corridor is generated around each route.
+5. Satellite imagery covering the relevant area is retrieved and processed.
+6. Flood-related areas are identified using the available spectral data.
+7. Each route is evaluated using sampled points and the estimated flood exposure.
+8. The system compares route risks and identifies a potentially safer alternative.
+
+### Technologies Used
+
+- **FastAPI** — backend API
+- **TomTom APIs** — geocoding and route generation
+- **Microsoft Planetary Computer** — satellite-data discovery and access
+- **Rasterio and NumPy** — raster processing and numerical analysis
+- **Geospatial libraries** — route corridors and spatial operations
+
+### Important Limitations
+
+- Satellite observations may not represent current road conditions.
+- Cloud cover, image availability, spatial coverage, and observation dates can affect results.
+- A route with lower estimated flood exposure is not guaranteed to be safe.
+- The system's assessment depends on the validity and coverage of the available satellite data.
+
+
 <img width="1130" height="786" alt="Screenshot 2026-08-26 124801" src="https://github.com/user-attachments/assets/e311bc3b-ffdf-46b0-a218-589429c3c811" />
 <img width="970" height="636" alt="Screenshot 2026-08-26 124809" src="https://github.com/user-attachments/assets/22941919-7151-4a33-83cb-27ad3e7548d9" />
 
