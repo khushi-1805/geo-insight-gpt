@@ -45,6 +45,9 @@ from rasterio.windows import from_bounds
 from rasterio.warp import transform_bounds, transform_geom
 from rasterio.enums import Resampling
 
+from confidence import attach_confidence
+from analysis.overlay import save_index_overlay
+
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -1197,7 +1200,14 @@ def calculate_yearly_urbanisation(
             "=============================="
         )
 
-        return {
+        overlay = save_index_overlay(
+            ndbi_valid,
+            geometry,
+            name=f"ndbi_{year}_{image.id}",
+            colormap="ndbi"
+        )
+
+        result = {
             "year": year,
             "builtup_percentage": builtup_percentage,
             "average_ndbi": average_ndbi,
@@ -1208,9 +1218,20 @@ def calculate_yearly_urbanisation(
             ),
             "cloud_cover": image.properties.get(
                 "eo:cloud_cover"
-            ),
-            "valid_pixel_fraction": valid_fraction
+            )
         }
+
+        result.update(
+            attach_confidence(
+                valid_fraction
+            )
+        )
+
+        result.update(
+            overlay
+        )
+
+        return result
 
     # ---------------------------------------------------------------
     # No suitable scene.

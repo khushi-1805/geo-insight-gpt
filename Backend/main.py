@@ -1,7 +1,10 @@
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-
+from fastapi.staticfiles import StaticFiles
+from flood.pipeline import run_flood_analysis
 import json
 import traceback
 import threading
@@ -10,8 +13,23 @@ import queue
 from llm.planner import understand_question
 from llm.reporter import generate_report
 from analysis_engine import run_analysis
+from flood.routing import geocode_route_locations, calculate_route
+from flood.corridor import create_route_corridor
+from dotenv import load_dotenv
 
+from flood.geocoding import geocode_location
+load_dotenv()
 
+import numpy as np
+
+from flood.geocoding import geocode_location
+from flood.routing import calculate_route
+from flood.preprocessing import (
+    load_flood_bands,
+    get_flood_raster_metadata,
+)
+from flood.flood_detection import detect_flood
+from flood.route_risk import calculate_route_risk
 # ============================================================
 # FASTAPI APPLICATION
 # ============================================================
@@ -34,6 +52,17 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+(STATIC_DIR / "overlays").mkdir(parents=True, exist_ok=True)
+
+app.mount(
+    "/static",
+    StaticFiles(directory=str(STATIC_DIR)),
+    name="static"
 )
 
 
@@ -66,6 +95,7 @@ def root():
 def empty_results():
 
     return {
+        "boundary": None,
         "analyses": {
             "vegetation": [],
             "water": [],
@@ -73,7 +103,100 @@ def empty_results():
         }
     }
 
+@app.get("/flood/analyze")
+def analyze_flood_route(
+    origin: str,
+    destination: str,
+):
+    try:
+        return run_flood_analysis(
+            origin,
+            destination,
+        )
 
+    except ValueError as error:
+        print("FLOOD ERROR:", error)
+        raise HTTPException(status_code=400, detail=str(error))
+
+    except Exception as error:
+        print("FLOOD ERROR:", error)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(error))
+
+    except Exception as error:
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
+
+@app.get("/flood/route-locations")
+def flood_route_locations(query: str):
+    try:
+        locations = geocode_route_locations(query)
+
+        route = calculate_route(
+            locations["origin"],
+            locations["destination"],
+        )
+
+        possible_route_area = create_route_corridor(
+            route["routes"]
+        )
+
+        return {
+            "success": True,
+            "origin": locations["origin"],
+            "destination": locations["destination"],
+            "route": route,
+            "possible_route_area": possible_route_area,
+        }
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    except Exception as error:
+        print("\n===== FLOOD ROUTING ERROR =====")
+        traceback.print_exc()
+        print("===============================\n")
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(error)
+        )
+@app.get("/flood/geocode")
+def flood_geocode(query: str):
+
+    try:
+
+        result = geocode_location(query)
+
+        return {
+            "success": True,
+            "location": result
+        }
+
+    except ValueError as error:
+
+        raise HTTPException(
+            status_code=404,
+            detail=str(error)
+        )
+
+    except Exception as error:
+
+        print("\n===== GEOCODING ERROR =====")
+        traceback.print_exc()
+        print("===========================\n")
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(error)
+        )
 # ============================================================
 # NORMAL ENDPOINT
 # ============================================================

@@ -88,6 +88,14 @@ def run_analysis(
             "end_year": end_year
         },
 
+        "boundary": {
+            "type": "Feature",
+            "properties": {
+                "name": location_name
+            },
+            "geometry": geometry
+        },
+
         "analyses": {}
     }
 

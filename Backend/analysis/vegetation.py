@@ -51,6 +51,9 @@ from rasterio.warp import (
 )
 from rasterio.enums import Resampling
 
+from confidence import attach_confidence
+from analysis.overlay import save_index_overlay
+
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -1133,7 +1136,14 @@ def calculate_yearly_vegetation(
             "=============================="
         )
 
-        return {
+        overlay = save_index_overlay(
+            ndvi_valid,
+            geometry,
+            name=f"ndvi_{year}_{image.id}",
+            colormap="ndvi"
+        )
+
+        result = {
             "year": year,
             "vegetation_percentage": (
                 vegetation_percentage
@@ -1145,11 +1155,20 @@ def calculate_yearly_vegetation(
             ),
             "cloud_cover": image.properties.get(
                 "eo:cloud_cover"
-            ),
-            "valid_pixel_fraction": (
-                valid_fraction
             )
         }
+
+        result.update(
+            attach_confidence(
+                valid_fraction
+            )
+        )
+
+        result.update(
+            overlay
+        )
+
+        return result
 
     # ---------------------------------------------------------------
     # No suitable scene

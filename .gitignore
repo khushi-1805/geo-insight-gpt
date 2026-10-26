@@ -1,4 +1,22 @@
-venv/
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+venv/
+.venv/
+
+# Generated flood analysis data
+flood_data/
+*.tif
+*.tiff
+
+# Frontend
+node_modules/
+.next/
+
+# Local configuration
+.vscode/

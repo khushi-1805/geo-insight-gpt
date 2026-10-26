@@ -1,14 +1,39 @@
 "use client";
-
+import { useRouter } from "next/navigation";
+import dynamic from "next/dynamic";
 import { useState } from "react";
 
-interface VegetationResult {
+import ConfidenceBadge from "./components/ConfidenceBadge";
+
+const AnalysisMap = dynamic(() => import("./components/AnalysisMap"), {
+  ssr: false,
+});
+
+interface YearlyResult {
   year: number;
   vegetation_percentage?: number;
   average_ndvi?: number;
+  water_percentage?: number;
+  average_mndwi?: number;
+  builtup_percentage?: number;
+  average_ndbi?: number;
   image_id?: string;
   image_date?: string;
+  valid_pixel_percentage?: number;
+  valid_pixel_fraction?: number;
+  confidence?: "high" | "medium" | "low";
+  overlay_url?: string;
+  overlay_bounds?: [[number, number], [number, number]];
   error?: string;
+}
+
+interface BoundaryFeature {
+  type: string;
+  properties?: Record<string, unknown>;
+  geometry?: {
+    type: string;
+    coordinates: unknown;
+  };
 }
 
 interface BackendResponse {
@@ -29,8 +54,11 @@ interface BackendResponse {
       start_year: number;
       end_year: number;
     };
+    boundary?: BoundaryFeature | null;
     analyses: {
-      vegetation?: VegetationResult[];
+      vegetation?: YearlyResult[];
+      water?: YearlyResult[];
+      urbanisation?: YearlyResult[];
       [key: string]: unknown;
     };
   };
@@ -46,6 +74,7 @@ interface ProgressItem {
 }
 
 export default function Home() {
+  const router = useRouter();
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
   const [messages, setMessages] = useState<BackendResponse[]>([]);
@@ -337,7 +366,7 @@ export default function Home() {
 
         <div className="p-4">
           <button
-            type="button"
+            type="button"z
             onClick={newChat}
             className="flex w-full items-center gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm transition hover:bg-white/[0.08]"
           >
@@ -345,7 +374,13 @@ export default function Home() {
             New analysis
           </button>
         </div>
-
+        <button
+  onClick={() => window.location.href = "/flood-route"}
+  className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-white/5 hover:text-white transition-colors"
+>
+  <span className="text-lg">🌊</span>
+  <span>Flood-Safe Route</span>
+</button>
         <div className="px-5 py-6">
 
           <div className="mb-4 flex items-center gap-3">
@@ -475,10 +510,30 @@ export default function Home() {
                         analysis={message.plan.analysis}
                       />
 
-                      {/* VEGETATION DATA */}
+                      <div className="mb-8">
+                        <AnalysisMap
+                          boundary={message.results.boundary}
+                          center={message.results.coordinates}
+                          overlayUrl={latestOverlay(message.results)?.overlay_url}
+                          overlayBounds={
+                            latestOverlay(message.results)?.overlay_bounds
+                          }
+                        />
+                      </div>
+
                       <VegetationSection
                         vegetation={
                           message.results.analyses.vegetation || []
+                        }
+                      />
+
+                      <WaterSection
+                        water={message.results.analyses.water || []}
+                      />
+
+                      <UrbanisationSection
+                        urbanisation={
+                          message.results.analyses.urbanisation || []
                         }
                       />
 
@@ -892,6 +947,43 @@ function AnalysisHeader({
 }
 
 
+function latestOverlay(results: BackendResponse["results"]) {
+  const groups = [
+    results.analyses.vegetation,
+    results.analyses.water,
+    results.analyses.urbanisation,
+  ];
+
+  let latest: YearlyResult | undefined;
+
+  for (const group of groups) {
+    if (!group) continue;
+
+    for (const row of group) {
+      if (!row?.overlay_url || !row.overlay_bounds) continue;
+
+      if (!latest || row.year >= latest.year) {
+        latest = row;
+      }
+    }
+  }
+
+  return latest;
+}
+
+function validPixelPercentage(item: YearlyResult) {
+  if (item.valid_pixel_percentage !== undefined) {
+    return item.valid_pixel_percentage;
+  }
+
+  if (item.valid_pixel_fraction !== undefined) {
+    return item.valid_pixel_fraction * 100;
+  }
+
+  return undefined;
+}
+
+
 /* ================================================= */
 /* VEGETATION SECTION */
 /* ================================================= */
@@ -899,7 +991,7 @@ function AnalysisHeader({
 function VegetationSection({
   vegetation,
 }: {
-  vegetation: VegetationResult[];
+  vegetation: YearlyResult[];
 }) {
   const valid = vegetation.filter(
     (item) =>
@@ -958,6 +1050,8 @@ function VegetationSection({
           value={`${last.vegetation_percentage!.toFixed(2)}%`}
           subtitle={`${last.year}`}
           icon="🌱"
+          confidence={last.confidence}
+          validPixels={validPixelPercentage(last)}
         />
 
         <MetricCard
@@ -965,6 +1059,8 @@ function VegetationSection({
           value={last.average_ndvi!.toFixed(3)}
           subtitle={`${last.year}`}
           icon="📡"
+          confidence={last.confidence}
+          validPixels={validPixelPercentage(last)}
         />
 
         <MetricCard
@@ -972,6 +1068,8 @@ function VegetationSection({
           value={`${highestVegetation.vegetation_percentage!.toFixed(2)}%`}
           subtitle={`${highestVegetation.year}`}
           icon="📈"
+          confidence={highestVegetation.confidence}
+          validPixels={validPixelPercentage(highestVegetation)}
         />
 
         <MetricCard
@@ -980,6 +1078,8 @@ function VegetationSection({
           subtitle={`${first.year} → ${last.year}`}
           icon={vegetationChange >= 0 ? "↗" : "↘"}
           negative={vegetationChange < 0}
+          confidence={last.confidence}
+          validPixels={validPixelPercentage(last)}
         />
 
       </div>
@@ -1072,6 +1172,7 @@ function VegetationSection({
                 <th className="px-5 py-3">Year</th>
                 <th className="px-5 py-3">Vegetation</th>
                 <th className="px-5 py-3">NDVI</th>
+                <th className="px-5 py-3">Confidence</th>
                 <th className="px-5 py-3">Observation</th>
               </tr>
             </thead>
@@ -1095,6 +1196,13 @@ function VegetationSection({
 
                   <td className="px-5 py-3.5 text-cyan-300">
                     {item.average_ndvi!.toFixed(3)}
+                  </td>
+
+                  <td className="px-5 py-3.5">
+                    <ConfidenceBadge
+                      confidence={item.confidence}
+                      percentage={validPixelPercentage(item)}
+                    />
                   </td>
 
                   <td className="px-5 py-3.5 text-white/40">
@@ -1603,18 +1711,130 @@ function formatBoldText(text: string) {
 /* METRIC CARD */
 /* ================================================= */
 
+function WaterSection({
+  water,
+}: {
+  water: YearlyResult[];
+}) {
+  const valid = water.filter(
+    (item) =>
+      item.water_percentage !== undefined &&
+      item.average_mndwi !== undefined
+  );
+
+  if (valid.length === 0) {
+    return null;
+  }
+
+  const last = valid[valid.length - 1];
+
+  return (
+    <div className="mt-10 space-y-6">
+      <div className="flex items-center gap-3">
+        <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-blue-400/10">
+          💧
+        </div>
+        <div>
+          <h3 className="font-semibold">Water Analysis</h3>
+          <p className="text-xs text-white/35">
+            Derived from Sentinel-2 MNDWI analysis
+          </p>
+        </div>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <MetricCard
+          label="Latest water coverage"
+          value={`${last.water_percentage!.toFixed(2)}%`}
+          subtitle={`${last.year}`}
+          icon="🌊"
+          confidence={last.confidence}
+          validPixels={validPixelPercentage(last)}
+        />
+        <MetricCard
+          label="Latest MNDWI"
+          value={last.average_mndwi!.toFixed(3)}
+          subtitle={`${last.year}`}
+          icon="📡"
+          confidence={last.confidence}
+          validPixels={validPixelPercentage(last)}
+        />
+      </div>
+    </div>
+  );
+}
+
+
+function UrbanisationSection({
+  urbanisation,
+}: {
+  urbanisation: YearlyResult[];
+}) {
+  const valid = urbanisation.filter(
+    (item) =>
+      item.builtup_percentage !== undefined &&
+      item.average_ndbi !== undefined
+  );
+
+  if (valid.length === 0) {
+    return null;
+  }
+
+  const last = valid[valid.length - 1];
+
+  return (
+    <div className="mt-10 space-y-6">
+      <div className="flex items-center gap-3">
+        <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-400/10">
+          🏙️
+        </div>
+        <div>
+          <h3 className="font-semibold">Urbanisation Analysis</h3>
+          <p className="text-xs text-white/35">
+            Derived from Sentinel-2 NDBI analysis
+          </p>
+        </div>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <MetricCard
+          label="Latest built-up coverage"
+          value={`${last.builtup_percentage!.toFixed(2)}%`}
+          subtitle={`${last.year}`}
+          icon="🏢"
+          confidence={last.confidence}
+          validPixels={validPixelPercentage(last)}
+        />
+        <MetricCard
+          label="Latest NDBI"
+          value={last.average_ndbi!.toFixed(3)}
+          subtitle={`${last.year}`}
+          icon="📡"
+          confidence={last.confidence}
+          validPixels={validPixelPercentage(last)}
+        />
+      </div>
+    </div>
+  );
+}
+
+
 function MetricCard({
   label,
   value,
   subtitle,
   icon,
   negative,
+  confidence,
+  validPixels,
 }: {
   label: string;
   value: string;
   subtitle: string;
   icon: string;
   negative?: boolean;
+  confidence?: YearlyResult["confidence"];
+  validPixels?: number;
 }) {
   return (
     <div className="group rounded-2xl border border-white/10 bg-white/[0.025] p-4 transition hover:-translate-y-0.5 hover:border-white/15 hover:bg-white/[0.045]">
@@ -1629,6 +1849,13 @@ function MetricCard({
           {icon}
         </span>
 
+      </div>
+
+      <div className="mb-2">
+        <ConfidenceBadge
+          confidence={confidence}
+          percentage={validPixels}
+        />
       </div>
 
       <p
