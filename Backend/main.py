@@ -1,5 +1,6 @@
 from pathlib import Path
 from evacuation.flood_escape import run_flood_escape_analysis
+from evacuation.directions import add_direct_directions
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -383,6 +384,7 @@ def search_evacuation_destinations(
 # FLOOD ESCAPE ENDPOINT
 # ============================================================
 
+
 @app.post("/evacuation/escape")
 def find_flood_escape(request: FloodEscapeRequest):
     try:
@@ -397,15 +399,25 @@ def find_flood_escape(request: FloodEscapeRequest):
             max_candidates=request.max_candidates,
         )
 
+        # Add direct distance and compass direction to each candidate.
+        # This is independent of TomTom road routing.
+        result = add_direct_directions(result)
+
         return jsonable_encoder(result)
 
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error))
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        )
 
     except Exception as error:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(error))
-    
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
+
 @app.post("/ask/stream")
 def ask_question_stream(
     question: str

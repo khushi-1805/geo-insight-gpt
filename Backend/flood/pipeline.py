@@ -193,11 +193,12 @@ def run_flood_analysis(
         )
 
         analyzed_routes.append({
-            "route_id": route["route_id"],
-            "summary": route["summary"],
-            "path": coordinates,
-            "flood_risk": risk,
-        })
+    "route_id": route["route_id"],
+    "summary": route["summary"],
+    "path": coordinates,
+    "instructions": route.get("instructions", []),
+    "flood_risk": risk,
+})
 
         if risk["risk"] == "unknown":
             print(

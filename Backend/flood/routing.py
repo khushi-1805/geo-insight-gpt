@@ -61,27 +61,29 @@ def calculate_route(origin, destination):
         )
 
     request_body = {
-        "routePlanningLocations": {
-            "origin": {
-                "type": "Point",
-                "coordinates": [
-                    origin["longitude"],
-                    origin["latitude"],
-                ],
-            },
-            "destination": {
-                "type": "Point",
-                "coordinates": [
-                    destination["longitude"],
-                    destination["latitude"],
-                ],
-            },
+    "routePlanningLocations": {
+        "origin": {
+            "type": "Point",
+            "coordinates": [
+                origin["longitude"],
+                origin["latitude"],
+            ],
         },
-        "routeType": "fast",
-        "traffic": "live",
-        "travelMode": "car",
-        "maxPathAlternativeRoutes": 2,
-    }
+        "destination": {
+            "type": "Point",
+            "coordinates": [
+                destination["longitude"],
+                destination["latitude"],
+            ],
+        },
+    },
+    "routeType": "fast",
+    "traffic": "live",
+    "travelMode": "car",
+    "maxPathAlternativeRoutes": 2,
+    "guidance": "instructions",
+    "instructionPhonetics": "ipa",
+}
 
     url = f"{TOMTOM_ROUTING_URL}?apiVersion=3"
 
@@ -91,6 +93,7 @@ def calculate_route(origin, destination):
         "Attributes": "routes",
         "Content-Type": "application/json",
         "Accept": "application/json",
+"Accept-Language": "en-GB",
     }
     request = Request(
         url,
@@ -183,10 +186,11 @@ def calculate_route(origin, destination):
             continue
 
         candidate_routes.append({
-            "route_id": index,
-            "summary": route.get("summary"),
-            "path": path,
-        })
+    "route_id": index,
+    "summary": route.get("summary"),
+    "path": path,
+    "instructions": route.get("instructions", []),
+})
 
     if not candidate_routes:
         raise ValueError(
