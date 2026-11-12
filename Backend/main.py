@@ -1,5 +1,5 @@
 from pathlib import Path
-
+from evacuation.flood_escape import run_flood_escape_analysis
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -30,6 +30,10 @@ from flood.preprocessing import (
 )
 from flood.flood_detection import detect_flood
 from flood.route_risk import calculate_route_risk
+from pydantic import BaseModel, Field
+from fastapi.encoders import jsonable_encoder
+
+from evacuation.pipeline import run_evacuation_analysis
 # ============================================================
 # FASTAPI APPLICATION
 # ============================================================
@@ -37,7 +41,30 @@ from flood.route_risk import calculate_route_risk
 app = FastAPI(
     title="Geo-Insight GPT API"
 )
+class FloodEscapeRequest(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
 
+    radius_m: float = Field(default=3000, gt=0)
+    safety_offset_m: float = Field(default=500, gt=0)
+
+    start_date: str | None = None
+    end_date: str | None = None
+
+    max_cloud_cover: float = Field(default=20, ge=0, le=100)
+    max_candidates: int = Field(default=5, ge=1, le=20)
+class EvacuationSearchRequest(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+
+    radius_m: float = Field(default=3000, gt=0)
+    min_area_m2: float = Field(default=10000, gt=0)
+
+    start_date: str | None = None
+    end_date: str | None = None
+
+    max_cloud_cover: float = Field(default=20, ge=0, le=100)
+    limit: int = Field(default=5, ge=1, le=20)
 
 # ============================================================
 # CORS
@@ -315,7 +342,70 @@ def ask_question(
 # ============================================================
 # STREAMING ENDPOINT
 # ============================================================
+# ============================================================
+# EVACUATION SEARCH ENDPOINT
+# ============================================================
 
+@app.post("/evacuation/search")
+def search_evacuation_destinations(
+    request: EvacuationSearchRequest
+):
+    try:
+        result = run_evacuation_analysis(
+            latitude=request.latitude,
+            longitude=request.longitude,
+            radius_m=request.radius_m,
+            min_area_m2=request.min_area_m2,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            max_cloud_cover=request.max_cloud_cover,
+            limit=request.limit,
+        )
+
+        return jsonable_encoder(result)
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        )
+
+    except Exception as error:
+        print("\n===== EVACUATION ERROR =====")
+        traceback.print_exc()
+        print("============================\n")
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
+# ============================================================
+# FLOOD ESCAPE ENDPOINT
+# ============================================================
+
+@app.post("/evacuation/escape")
+def find_flood_escape(request: FloodEscapeRequest):
+    try:
+        result = run_flood_escape_analysis(
+            latitude=request.latitude,
+            longitude=request.longitude,
+            radius_m=request.radius_m,
+            safety_offset_m=request.safety_offset_m,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            max_cloud_cover=request.max_cloud_cover,
+            max_candidates=request.max_candidates,
+        )
+
+        return jsonable_encoder(result)
+
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    except Exception as error:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(error))
+    
 @app.post("/ask/stream")
 def ask_question_stream(
     question: str

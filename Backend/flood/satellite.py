@@ -63,6 +63,12 @@ def search_satellite_images(
             print(f"Skipping {item.id}; missing bands: {', '.join(missing)}")
             continue
 
+        # SCL is optional for shared flood-routing compatibility, but the
+        # evacuation workflow downloads it whenever the scene provides it.
+        scl_asset = item.assets.get("SCL") or item.assets.get("scl")
+        if scl_asset is not None:
+            assets["SCL"] = scl_asset.href
+
         results.append({
             "id": item.id,
             "date": item.datetime.isoformat() if item.datetime else None,
@@ -166,5 +172,28 @@ def download_and_clip_bands(image, possible_route_area, output_dir="flood_data")
 
     if set(downloaded) != set(FLOOD_BANDS):
         raise RuntimeError("Not all required Sentinel-2 bands were downloaded.")
+
+    return downloaded
+
+
+def download_evacuation_bands(image, search_area, output_dir="evacuation_data"):
+    """
+    Download the six reflectance bands plus SCL when the scene provides it.
+
+    This is intentionally separate from download_and_clip_bands so the
+    existing Flood Routing workflow keeps its six-band behaviour unchanged.
+    """
+    downloaded = download_and_clip_bands(
+        image=image,
+        possible_route_area=search_area,
+        output_dir=output_dir,
+    )
+
+    scl_url = image.get("assets", {}).get("SCL")
+    if scl_url:
+        _, scl_path = download_one_band(
+            "SCL", scl_url, search_area, output_dir
+        )
+        downloaded["SCL"] = scl_path
 
     return downloaded

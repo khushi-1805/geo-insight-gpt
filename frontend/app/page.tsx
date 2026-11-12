@@ -366,7 +366,7 @@ export default function Home() {
 
         <div className="p-4">
           <button
-            type="button"z
+            type="button"
             onClick={newChat}
             className="flex w-full items-center gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm transition hover:bg-white/[0.08]"
           >
@@ -381,6 +381,14 @@ export default function Home() {
   <span className="text-lg">🌊</span>
   <span>Flood-Safe Route</span>
 </button>
+        <button
+          type="button"
+          onClick={() => router.push("/evacuation-point")}
+          className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-white/5 hover:text-white transition-colors"
+        >
+          <span className="text-lg">🧭</span>
+          <span>Evacuation Point</span>
+        </button>
         <div className="px-5 py-6">
 
           <div className="mb-4 flex items-center gap-3">
